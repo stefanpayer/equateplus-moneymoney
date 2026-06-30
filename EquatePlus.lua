@@ -272,11 +272,20 @@ function InitializeSession2 (protocol, bankCode, step, credentials, interactive)
     -- print("login first stage")
     html:xpath("//*[@id='eqUserId']"):attr("value", username)
     html:xpath("//*[@id='submitField']"):attr("value","Continue Login")
-    html= HTML(connectWithCSRF(html:xpath("//*[@id='loginForm']"):submit()))
+    local firstStageContent = connectWithCSRF(html:xpath("//*[@id='loginForm']"):submit())
+    html = HTML(firstStageContent)
+    -- Update dcHost if the server redirected us to a specific datacenter (e.g. NA, APAC).
+    -- normalize() in connectWithCSRF rewrites all subsequent URLs to dcHost automatically.
+    local dcHint = string.match(firstStageContent, "Eqp_datacenter%s*=%s*'([^']+)'")
+    if dcHint == 'NA' then
+      dcHost = "https://www.na.equateplus.com"
+    elseif dcHint == 'APAC' then
+      dcHost = "https://www.apac.equateplus.com"
+    end
     if not hasLoginForm(html) then return "EquatePlus plugin error: No login mask found!" end
 
-    -- second login stage: manual POST to include CSRF token in body
-    -- (HTML:submit() misses JS-injected hidden fields like csrfpId)
+    -- second login stage: submit password to establish the authenticated session,
+    -- after which the FIDO/QR API becomes available
     local function urlEncode(s)
       return (s:gsub("([^%w%-%.%_%~ ])", function(c)
         return string.format("%%%02X", string.byte(c))
@@ -344,10 +353,10 @@ function InitializeSession2 (protocol, bankCode, step, credentials, interactive)
       }
     end
 
-    -- Fallback to FIDO/QR flow (ensure client/session ids for JSON orchestration)
+    -- FIDO/QR flow: password session established, now request the FIDO challenge
     local resp = connectWithCSRF(
       "POST",
-      "https://www.equateplus.com/EquatePlusParticipant2/?login&_cId="..cId.."&_rId="..rnd(),
+      dcHost .. "/EquatePlusParticipant2/?login&_cId="..cId.."&_rId="..rnd(),
       "isiwebuserid="..urlencode(username).."&isiwebpasswd=null&result=null",
       "application/x-www-form-urlencoded"
     )
@@ -358,9 +367,20 @@ function InitializeSession2 (protocol, bankCode, step, credentials, interactive)
     local target = json["dispatchTargets"][1]
 
     -- get qr code
-    json = JSON(connectWithCSRF("GET","https://www.equateplus.com/EquatePlusParticipant2/?login&o.dispatchTargetId.v="..target["id"].."&_cId="..cId.."&_rId="..rnd())):dictionary()
+    json = JSON(connectWithCSRF("GET", dcHost .. "/EquatePlusParticipant2/?login&o.dispatchTargetId.v="..target["id"].."&_cId="..cId.."&_rId="..rnd())):dictionary()
     session_id = json["sessionId"]
     local challenge = json["dispatcherInformation"]["response"]
+
+    if debugging then
+      print("FIDO target name: " .. tostring(target["name"]))
+      print("FIDO session_id present: " .. tostring(session_id ~= nil))
+      if challenge then
+        print("Challenge length: " .. #challenge)
+        print("Challenge[1..120]: " .. string.sub(challenge, 1, 120))
+      else
+        print("Challenge is nil!")
+      end
+    end
 
     -- request authentication
     return {
@@ -447,6 +467,34 @@ function ListAccounts (knownAccounts)
   if debugging then tprint (user) end
   -- Return array of accounts.
   reportOnce=true
+
+  -- The reportingCurrency (e.g. EUR) is the user's display preference, but the
+  -- underlying shares (e.g. IBM on NYSE) trade in a different currency (e.g. USD).
+  -- Using the reporting currency causes MoneyMoney to mislabel the USD total as EUR.
+  -- Detect the actual trading currency from the first plan's last purchase price.
+  local portfolioCurrency = user["reportingCurrency"]["code"]
+  pcall(function()
+    local summary = JSON(connectWithCSRF(
+      "POST",
+      "https://www.equateplus.com/EquatePlusParticipant2/services/planSummary/get?_cId="..cId.."&_rId="..rnd(),
+      "{\"$type\":\"Object\"}",
+      "application/json;charset=UTF-8")):dictionary()
+    if not (summary and summary["entries"] and summary["entries"][1]) then return end
+    local details = JSON(connectWithCSRF(
+      "POST",
+      "https://www.equateplus.com/EquatePlusParticipant2/services/planDetails/get?_cId="..cId.."&_rId="..rnd(),
+      "{\"$type\":\"EntityIdentifier\",\"id\":\""..summary["entries"][1]["id"].."\"}",
+      "application/json;charset=UTF-8")):dictionary()
+    if not (details and details["entries"] and details["entries"][1]) then return end
+    local grp = details["entries"][1]
+    if not (grp["entries"] and grp["entries"][1]) then return end
+    local contrib = grp["entries"][1]
+    local lpp = contrib["totals"] and contrib["totals"]["LAST_PURCHASE_PRICE"]
+    if lpp and lpp["unit"] and lpp["unit"]["code"] then
+      portfolioCurrency = lpp["unit"]["code"]
+    end
+  end)
+
   local account
   local status,err = pcall( function()
     account = {
@@ -454,7 +502,7 @@ function ListAccounts (knownAccounts)
       --owner = user["participant"]["firstName"]["displayValue"].." "..user["participant"]["lastName"]["displayValue"],
       accountNumber = user["participant"]["userId"],
       bankCode = "equatePlus",
-      currency = user["reportingCurrency"]["code"],
+      currency = portfolioCurrency,
       portfolio = true,
       type = AccountTypePortfolio
     }
